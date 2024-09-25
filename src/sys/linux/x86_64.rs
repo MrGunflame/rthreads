@@ -1,9 +1,10 @@
 use core::arch::asm;
-use std::hint::unreachable_unchecked;
+use core::hint::unreachable_unchecked;
+use core::sync::atomic::AtomicU32;
 
 use linux_raw_sys::general::{
-    __NR_clone3, __NR_exit, __NR_mmap, __NR_munmap, MAP_ANONYMOUS, MAP_PRIVATE, MAP_STACK,
-    PROT_READ, PROT_WRITE,
+    __NR_clone3, __NR_exit, __NR_futex, __NR_mmap, __NR_munmap, FUTEX_PRIVATE_FLAG, FUTEX_WAIT,
+    FUTEX_WAKE, MAP_ANONYMOUS, MAP_PRIVATE, MAP_STACK, PROT_READ, PROT_WRITE,
 };
 
 use crate::sys::{clone_args, Stack};
@@ -84,5 +85,37 @@ pub(crate) unsafe fn exit_thread(code: i32, stack: Stack) -> ! {
         );
 
         unreachable_unchecked()
+    }
+}
+
+pub(crate) fn wait(futex: &AtomicU32, expected: u32) {
+    unsafe {
+        asm!(
+            "syscall",
+            in("rax") __NR_futex,
+            // uaddr
+            in("rdi") futex,
+            // op
+            in("rsi") FUTEX_PRIVATE_FLAG | FUTEX_WAIT,
+            // val
+            in("rdx") expected,
+            // utime
+            in("r10") 0,
+        );
+    }
+}
+
+pub(crate) fn wake(futex: &AtomicU32) {
+    unsafe {
+        asm!(
+            "syscall",
+            in("rax") __NR_futex,
+            // uaddr
+            in("rdi") futex,
+            // op
+            in("rsi") FUTEX_PRIVATE_FLAG | FUTEX_WAKE,
+            // val
+            in("rdx") 1,
+        );
     }
 }

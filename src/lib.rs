@@ -1,15 +1,24 @@
+#![no_std]
+
 extern crate alloc;
 
 mod sys;
 
 use alloc::boxed::Box;
+use core::cell::UnsafeCell;
 use core::ffi::c_ulonglong;
 use core::mem::ManuallyDrop;
-use std::sync::{Arc, Condvar, Mutex};
+use core::mem::MaybeUninit;
+use core::sync::atomic::{AtomicU32, Ordering};
+
+use alloc::sync::Arc;
 
 use libc::{c_uint, CLONE_FILES, CLONE_FS, CLONE_SIGHAND, CLONE_SYSVSEM, CLONE_THREAD, CLONE_VM};
 
-use sys::{clone_args, create_stack, exit_thread, fork_thread, Stack};
+use sys::{clone_args, create_stack, exit_thread, fork_thread, wait, wake, Stack};
+
+const FUTEX_INIT: u32 = 0;
+const FUTEX_DONE: u32 = 1;
 
 pub struct Builder {}
 
@@ -42,20 +51,19 @@ pub struct JoinHandle<T> {
 
 impl<T> JoinHandle<T> {
     pub fn join(self) -> T {
-        let mut guard = self.inner.mutex.lock().unwrap();
         loop {
-            if let Some(value) = guard.take() {
-                return value;
+            if self.inner.futex.load(Ordering::Acquire) == FUTEX_DONE {
+                return unsafe { (*self.inner.value.get()).assume_init_read() };
             }
 
-            guard = self.inner.cvar.wait(guard).unwrap();
+            wait(&self.inner.futex, FUTEX_DONE);
         }
     }
 }
 
 struct JoinState<T> {
-    mutex: Mutex<Option<T>>,
-    cvar: Condvar,
+    value: UnsafeCell<MaybeUninit<T>>,
+    futex: AtomicU32,
 }
 
 struct ThreadState<T, F> {
@@ -84,8 +92,8 @@ where
     }
 
     let join_state = Arc::new(JoinState {
-        mutex: Mutex::new(None),
-        cvar: Condvar::new(),
+        value: UnsafeCell::new(MaybeUninit::uninit()),
+        futex: AtomicU32::new(FUTEX_INIT),
     });
     let f = Box::into_raw(Box::new(ThreadState {
         join_state: join_state.clone(),
@@ -118,8 +126,9 @@ where
         let f = unsafe { ManuallyDrop::take(&mut state.f) };
         let value = f();
 
-        *state.join_state.mutex.lock().unwrap() = Some(value);
-        state.join_state.cvar.notify_one();
+        (*state.join_state.value.get()).write(value);
+        state.join_state.futex.store(FUTEX_DONE, Ordering::Release);
+        wake(&state.join_state.futex);
 
         let stack = state.stack;
         drop(state);
